@@ -212,17 +212,23 @@ const AT = (() => {
 })();
 
 const PLAYER_CORE = `// AirTap listener playback core. Runs inside an AudioWorklet (or a ScriptProcessor fallback).
+// The buffer adapts: it starts at targetSec, grows x1.5 after every dropout (up to maxSec), and eases back
+// toward the start value after two minutes without one. Internet paths stall now and then; a reliable data
+// channel delivers everything, just late, so a bigger cushion is the fix, not dropping data.
 // Source frames go into a ring; output is read at srcRate/outRate * drift with a Kaiser-windowed sinc
 // interpolator (32 taps, 512 phases), so the browser's clock and AirTap's clock can differ without clicks,
 // and without the top-end loss a linear interpolator would cause.
 class AirTapPlayerCore {
-  constructor(srcRate, outRate, targetSec) {
+  constructor(srcRate, outRate, targetSec, maxSec) {
     this.cap = 1 << 19; this.mask = this.cap - 1;
     this.L = new Float32Array(this.cap); this.R = new Float32Array(this.cap);
     this.w = 0; this.r = 0;
     this.srcRate = srcRate;
     this.base = srcRate / outRate;
-    this.target = Math.round(targetSec * srcRate);
+    this.outRate = outRate;
+    this.initialTarget = this.target = Math.round(targetSec * srcRate);
+    this.maxTarget = Math.round((maxSec || 4) * srcRate);
+    this.rebuffers = 0; this.stableFrames = 0;
     this.started = false; this.drift = 1; this.avg = 0; this.under = 0; this.peakL = 0; this.peakR = 0;
     const Z = this.Z = 16, P = this.P = 512, T = 2 * Z;
     const fc = Math.min(1, 1 / this.base) * 0.97;
@@ -264,7 +270,14 @@ class AirTapPlayerCore {
     let pl = this.peakL, pr = this.peakR;
     for (let n = 0; n < N; n++) {
       const i = Math.floor(this.r);
-      if (i + Z >= this.w) { oL[n] = 0; oR[n] = 0; this.under++; this.started = false; continue; }
+      if (i + Z >= this.w) {
+        oL[n] = 0; oR[n] = 0; this.under++;
+        if (this.started) {   // ran dry: refill to a bigger cushion before playing again
+          this.started = false; this.rebuffers++; this.stableFrames = 0;
+          this.target = Math.min(this.maxTarget, Math.round(this.target * 1.5));
+        }
+        continue;
+      }
       const fp = (this.r - i) * P, p = fp | 0, a = fp - p, t0 = p * T, t1 = t0 + T, b = i - (Z - 1);
       let sl = 0, sr = 0;
       for (let k = 0; k < T; k++) {
@@ -277,9 +290,16 @@ class AirTapPlayerCore {
       this.r += step;
     }
     this.peakL = pl; this.peakR = pr;
+    if (this.started) {
+      this.stableFrames += N;
+      if (this.stableFrames > 120 * this.outRate && this.target > this.initialTarget) {
+        this.target = Math.max(this.initialTarget, Math.round(this.target * 0.9)); this.stableFrames = 0;
+      }
+    }
   }
   stats() {
-    const s = { fill: (this.w - this.r) / this.srcRate, ppm: (this.drift - 1) * 1e6, under: this.under, peakL: this.peakL, peakR: this.peakR, playing: this.started };
+    const s = { fill: (this.w - this.r) / this.srcRate, target: this.target / this.srcRate, rebuffers: this.rebuffers,
+                ppm: (this.drift - 1) * 1e6, under: this.under, peakL: this.peakL, peakR: this.peakR, playing: this.started };
     this.peakL = 0; this.peakR = 0; return s;
   }
 }
@@ -288,7 +308,7 @@ class AirTapPlayerCore {
   const $ = (id) => document.getElementById(id);
   const streamId = decodeURIComponent((location.hash || '').slice(1)).trim();
   window.addEventListener('hashchange', () => location.reload());
-  const TARGET = 0.4;               // seconds of audio held in the player buffer
+  const TARGET = 1.0, MAX_TARGET = 4.0;   // seconds of audio held in the player buffer: starts at 1 s, grows after a dropout
   let sig = null, pc = null, dc = null, ctx = null, node = null, gain = null, sp = null, core = null;
   let hello = null, authed = false, bits = 24, pendingCands = [], denied = false, wantStop = false, connectTimer = null, statTimer = null, cid = '';
 
@@ -313,7 +333,7 @@ class AirTapPlayerCore {
       if (ctx.audioWorklet) {
         const src = PLAYER_CORE + `
           class AirTapPlayer extends AudioWorkletProcessor {
-            constructor(o) { super(); const p = o.processorOptions; this.core = new AirTapPlayerCore(p.srcRate, sampleRate, p.target); this.n = 0;
+            constructor(o) { super(); const p = o.processorOptions; this.core = new AirTapPlayerCore(p.srcRate, sampleRate, p.target, p.max); this.n = 0;
               this.port.onmessage = (e) => this.core.push(e.data); }
             process(_, outs) { const o = outs[0]; this.core.render(o[0], o[1] || o[0], o[0].length);
               if (++this.n % 48 === 0) this.port.postMessage(this.core.stats()); return true; }
@@ -329,12 +349,12 @@ class AirTapPlayerCore {
     stopPlayer();
     if (ctx.audioWorklet) {
       node = new AudioWorkletNode(ctx, 'airtap-player', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2],
-                                                          processorOptions: { srcRate: rate, target: TARGET } });
+                                                          processorOptions: { srcRate: rate, target: TARGET, max: MAX_TARGET } });
       node.port.onmessage = (e) => onPlayerStats(e.data);
       node.connect(gain);
     } else {   // not a secure context (e.g. opened over plain http): main-thread fallback
       const Core = new Function(PLAYER_CORE + '; return AirTapPlayerCore;')();
-      core = new Core(rate, ctx.sampleRate, TARGET);
+      core = new Core(rate, ctx.sampleRate, TARGET, MAX_TARGET);
       sp = ctx.createScriptProcessor(4096, 0, 2);
       sp.onaudioprocess = (e) => { const b = e.outputBuffer; core.render(b.getChannelData(0), b.getChannelData(1), b.length); };
       sp.connect(gain);
@@ -349,8 +369,9 @@ class AirTapPlayerCore {
   }
   function pushAudio(f) { if (node) node.port.postMessage(f, [f.buffer]); else if (core) core.push(f); }
 
-  let lastInfo = 0;
+  let lastInfo = 0, lastStats = null;
   function onPlayerStats(s) {
+    lastStats = s;
     const db = (v) => v > 0 ? Math.max(0, Math.min(100, (20 * Math.log10(v) + 60) / 60 * 100)) : 0;
     $('mL').style.width = db(s.peakL) + '%'; $('mR').style.width = db(s.peakR) + '%';
     const now = performance.now();
@@ -358,11 +379,35 @@ class AirTapPlayerCore {
       lastInfo = now;
       AT.route(pc).then((r) => {
         setDetail(kHz(hello.rate) + ' · ' + fmtName(bits) + (r ? ' · ' + (r === 'direct' ? 'direct connection' : 'through relay') : '') +
-                  ' · buffer ' + s.fill.toFixed(2) + ' s' + (s.under ? ' · dropouts ' + s.under : ''));
+                  ' · buffer ' + s.fill.toFixed(1) + ' s' + (s.rebuffers ? ' · rebuffered ' + s.rebuffers + '×' : ''));
       });
       if (authed) setStatus(s.playing ? 'Playing' : 'Buffering…', s.playing ? 'ok' : '');
     }
   }
+
+  // every 2 s: tell the sender how this end is doing (shows up in AirTap's log)
+  let telBytes = 0, telT = 0;
+  setInterval(async () => {
+    if (!authed || !dc || dc.readyState !== 'open' || !lastStats || !pc) return;
+    let rtt = null, bytes = 0, route = '';
+    try {
+      const st = await pc.getStats(); let pid = null;
+      st.forEach((r) => {
+        if (r.type === 'transport') { if (r.selectedCandidatePairId) pid = r.selectedCandidatePairId; if (r.bytesReceived) bytes = r.bytesReceived; }
+      });
+      const pair = pid && st.get(pid);
+      if (pair) { if (pair.currentRoundTripTime != null) rtt = Math.round(pair.currentRoundTripTime * 1000); if (!bytes && pair.bytesReceived) bytes = pair.bytesReceived; }
+      route = await AT.route(pc);
+    } catch (_) {}
+    const now = performance.now(), kbps = telT && bytes ? Math.round((bytes - telBytes) * 8 / (now - telT)) : null;
+    telBytes = bytes; telT = now;
+    const s = lastStats;
+    try {
+      dc.send(JSON.stringify({ t: 'stats', fill: +s.fill.toFixed(2), target: +s.target.toFixed(2), rebuffers: s.rebuffers, under: s.under,
+                               ppm: Math.round(s.ppm), playing: s.playing, ctxRate: ctx ? ctx.sampleRate : 0, rtt, kbps, route,
+                               ua: navigator.userAgent.slice(0, 160) }));
+    } catch (_) {}
+  }, 2000);
 
   function decode(buf, b) {
     if (b === 32) return new Float32Array(buf);
