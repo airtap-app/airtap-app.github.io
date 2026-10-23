@@ -1,0 +1,484 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex">
+<title>AirTap Listen</title>
+<style>
+  :root { --bg:#f4f3ef; --card:#ffffff; --ink:#1d1c1a; --mute:#6b6862; --line:#dedbd3; --accent:#d4542b; --ok:#2f8a57; --bad:#c23b2b; --meter:#1d1c1a; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#141412; --card:#1e1d1b; --ink:#efece6; --mute:#9a968e; --line:#34322e; --accent:#ee7146; --ok:#5cc489; --bad:#ef6b5b; --meter:#efece6; } }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 460px; margin: 0 auto; padding: max(28px, env(safe-area-inset-top)) 16px 40px; }
+  .brand { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
+  .dot { width: 12px; height: 12px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 20%, transparent); }
+  .brand b { font-size: 20px; letter-spacing: -0.01em; }
+  .brand span { color: var(--mute); font-size: 14px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 20px; }
+  #status { font-size: 19px; font-weight: 600; margin: 0 0 4px; }
+  #detail { color: var(--mute); font-size: 14px; min-height: 20px; margin: 0 0 16px; }
+  label { display: block; font-size: 13px; color: var(--mute); margin: 12px 0 6px; }
+  input[type=password], select { width: 100%; font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 11px 12px; }
+  .row { display: flex; gap: 10px; margin-top: 16px; }
+  button { flex: 1; font: inherit; font-weight: 600; border: 0; border-radius: 10px; padding: 12px; cursor: pointer; }
+  #go { background: var(--accent); color: #fff; }
+  #stop { background: transparent; color: var(--ink); border: 1px solid var(--line); }
+  button:disabled { opacity: .45; cursor: default; }
+  .meters { display: grid; grid-template-columns: 18px 1fr; gap: 6px 10px; align-items: center; margin: 4px 0 14px; font-size: 12px; color: var(--mute); }
+  .bar { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; }
+  .bar i { display: block; height: 100%; width: 0; background: var(--meter); transition: width 60ms linear; }
+  .vol { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--mute); }
+  .vol input { flex: 1; accent-color: var(--accent); }
+  #player[hidden], #form[hidden] { display: none; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); }
+  footer { color: var(--mute); font-size: 12px; margin-top: 14px; line-height: 1.5; }
+</style>
+</head>
+<body>
+<main>
+  <div class="brand"><div class="dot"></div><b>AirTap</b><span>live stream</span></div>
+  <div class="card">
+    <p id="status">Ready</p>
+    <p id="detail">Enter the password you were given, then press Listen.</p>
+    <div id="player" hidden>
+      <div class="meters"><span>L</span><div class="bar"><i id="mL"></i></div><span>R</span><div class="bar"><i id="mR"></i></div></div>
+      <div class="vol"><span>Volume</span><input id="vol" type="range" min="0" max="1" step="0.01" value="1"></div>
+    </div>
+    <div id="form">
+      <label for="pw">Password</label>
+      <input id="pw" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="leave empty if there is none">
+      <label for="q">Quality</label>
+      <select id="q">
+        <option value="24" selected>Lossless 24-bit (2.1 Mbps)</option>
+        <option value="32">Bit-exact 32-bit float (2.8 Mbps)</option>
+        <option value="16">16-bit, for slow connections (1.4 Mbps)</option>
+      </select>
+    </div>
+    <div class="row"><button id="go">Listen</button><button id="stop" disabled>Stop</button></div>
+  </div>
+  <footer>Audio travels directly from the sender's computer to this page, encrypted. A public handshake server only introduces the two; it never carries audio. Your password never leaves this page.</footer>
+</main>
+<script>
+// AirTap P2P core, shared by the sender page (inside AirTap) and the listener page.
+// - SHA-256 / HMAC-SHA256 in plain JS (works with or without a secure context)
+// - a minimal client for the public PeerJS handshake server (wss://0.peerjs.com, same wire protocol as PeerJS 1.5.5):
+//   it only relays the WebRTC offer/answer/candidates; the audio never passes through it
+// - the password proof: HMAC(password, nonce | sender DTLS fingerprint | listener DTLS fingerprint), so the proof is
+//   bound to this exact encrypted connection and nobody in the middle (not even the handshake server) can replay it
+let AT_dbg = () => {};      // pages may replace this to see socket events
+const AT = (() => {
+  const K = new Uint32Array(64), H0 = new Uint32Array(8);
+  (() => {
+    const isPrime = (x) => { for (let d = 2; d * d <= x; d++) if (x % d === 0) return false; return true; };
+    for (let n = 0, p = 2; n < 64; p++) {
+      if (!isPrime(p)) continue;
+      if (n < 8) H0[n] = (Math.sqrt(p) % 1) * 4294967296;
+      K[n] = (Math.cbrt(p) % 1) * 4294967296;
+      n++;
+    }
+  })();
+  const ror = (x, n) => (x >>> n) | (x << (32 - n));
+
+  function sha256(msg) {
+    const l = msg.length, total = ((l + 9 + 63) >> 6) << 6;
+    const buf = new Uint8Array(total); buf.set(msg); buf[l] = 0x80;
+    const dv = new DataView(buf.buffer);
+    dv.setUint32(total - 4, (l * 8) >>> 0);
+    dv.setUint32(total - 8, Math.floor(l / 536870912));
+    const h = Uint32Array.from(H0), w = new Uint32Array(64);
+    for (let o = 0; o < total; o += 64) {
+      for (let i = 0; i < 16; i++) w[i] = dv.getUint32(o + i * 4);
+      for (let i = 16; i < 64; i++) {
+        const a = w[i - 15], b = w[i - 2];
+        w[i] = (w[i - 16] + (ror(a, 7) ^ ror(a, 18) ^ (a >>> 3)) + w[i - 7] + (ror(b, 17) ^ ror(b, 19) ^ (b >>> 10))) >>> 0;
+      }
+      let a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+      for (let i = 0; i < 64; i++) {
+        const t1 = (hh + (ror(e, 6) ^ ror(e, 11) ^ ror(e, 25)) + ((e & f) ^ (~e & g)) + K[i] + w[i]) >>> 0;
+        const t2 = ((ror(a, 2) ^ ror(a, 13) ^ ror(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) >>> 0;
+        hh = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+      }
+      h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+    }
+    const out = new Uint8Array(32), odv = new DataView(out.buffer);
+    for (let i = 0; i < 8; i++) odv.setUint32(i * 4, h[i]);
+    return out;
+  }
+
+  function hmac(key, msg) {
+    if (key.length > 64) key = sha256(key);
+    const k = new Uint8Array(64); k.set(key);
+    const ip = new Uint8Array(64 + msg.length), op = new Uint8Array(96);
+    for (let i = 0; i < 64; i++) { ip[i] = k[i] ^ 0x36; op[i] = k[i] ^ 0x5c; }
+    ip.set(msg, 64); op.set(sha256(ip), 64);
+    return sha256(op);
+  }
+
+  const enc = (s) => new TextEncoder().encode(s);
+  const hex = (u) => Array.from(u, (b) => b.toString(16).padStart(2, '0')).join('');
+  const ALPHA = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const randId = (n) => Array.from(crypto.getRandomValues(new Uint8Array(n)), (x) => ALPHA[x % ALPHA.length]).join('');
+  const validId = (id) => typeof id === 'string' && id.length > 0 && id.length <= 64 && /^[A-Za-z0-9]+(?:[_-][A-Za-z0-9]+)*$/.test(id);
+  const fingerprint = (sdp) => {
+    const m = /a=fingerprint:(\S+)\s+(\S+)/i.exec(sdp || '');
+    return m ? m[1].toLowerCase() + ' ' + m[2].toUpperCase() : '';
+  };
+  const proof = (password, nonce, senderSdp, listenerSdp) =>
+    hex(hmac(enc(password), enc('airtap-v1|' + nonce + '|' + fingerprint(senderSdp) + '|' + fingerprint(listenerSdp))));
+  const safeEq = (a, b) => {
+    if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
+    let x = 0; for (let i = 0; i < a.length; i++) x |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    return x === 0;
+  };
+
+  // STUN to learn the public address; the PeerJS relay is only used when two networks cannot connect directly
+  const ICE = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: ['turn:eu-0.turn.peerjs.com:3478', 'turn:us-0.turn.peerjs.com:3478'], username: 'peerjs', credential: 'peerjsp' },
+  ];
+
+  class Signal {
+    constructor(id, onMessage, onState) {
+      this.id = id; this.onMessage = onMessage; this.onState = onState || (() => {});
+      this.ws = null; this.hb = null; this.retry = null; this.closed = false;
+    }
+    open() {
+      this.closed = false;
+      const url = 'wss://0.peerjs.com:443/peerjs?key=peerjs&id=' + encodeURIComponent(this.id) +
+                  '&token=' + randId(12) + '&version=1.5.5';
+      AT_dbg('ws connecting');
+      let ws;
+      try { ws = this.ws = new WebSocket(url); } catch (err) { AT_dbg('ws constructor threw: ' + err); this.reopenLater(5000); return; }
+      ws.onopen = () => { AT_dbg('ws open'); this.lastBeat = Date.now(); clearInterval(this.hb); this.hb = setInterval(() => this.beat(), 5000); };
+      ws.onmessage = (e) => {
+        let m; try { m = JSON.parse(e.data); } catch (_) { return; }
+        if (m.type === 'OPEN') this.onState('open');
+        else if (m.type === 'ID-TAKEN') { this.onState('id-taken'); this.reopenLater(5000); }
+        else if (m.type === 'ERROR' || m.type === 'INVALID-KEY') this.onState('error', (m.payload && m.payload.msg) || m.type);
+        else this.onMessage(m);
+      };
+      ws.onclose = (e) => {
+        AT_dbg('ws closed, code ' + e.code + (e.reason ? ' ' + e.reason : ''));
+        clearInterval(this.hb); this.hb = null;
+        if (ws !== this.ws || this.closed) return;
+        this.onState('closed'); this.reopenLater(3000);
+      };
+      ws.onerror = () => AT_dbg('ws error');
+    }
+    reopenLater(ms) {
+      if (this.closed) return;
+      clearTimeout(this.retry);
+      const old = this.ws; this.ws = null;
+      try { old && old.close(); } catch (_) {}
+      this.reopenAt = Date.now() + ms;
+      this.retry = setTimeout(() => { if (!this.closed && !this.ws) { this.reopenAt = 0; this.open(); } }, ms);
+    }
+    // heartbeat (PeerJS server drops a socket after 60 s without one); safe to call as often as you like
+    beat() {
+      const now = Date.now();
+      if (this.ws && this.ws.readyState === 1 && now - (this.lastBeat || 0) >= 4000) { this.lastBeat = now; this.raw({ type: 'HEARTBEAT' }); }
+      if (!this.closed && !this.ws && this.reopenAt && now >= this.reopenAt) { this.reopenAt = 0; this.open(); }
+    }
+    raw(m) { if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify(m)); }
+    send(type, dst, payload) { this.raw({ type, dst, payload }); }
+    close() {
+      this.closed = true; clearTimeout(this.retry); clearInterval(this.hb);
+      try { this.ws && this.ws.close(); } catch (_) {}
+      this.ws = null;
+    }
+  }
+
+  const sdpOf = (d) => ({ type: d.type, sdp: d.sdp });
+  // The public server only relays messages shaped like PeerJS data-connection messages (type 'data' +
+  // connectionId; it re-serialises them and drops anything else), so every payload carries those fields.
+  const wire = (connectionId, extra) => Object.assign({ type: 'data', connectionId, label: 'airtap', reliable: true,
+                                                        serialization: 'raw', browser: 'chrome' }, extra);
+  const candOf = (c) => (c.toJSON ? c.toJSON() : { candidate: c.candidate, sdpMid: c.sdpMid, sdpMLineIndex: c.sdpMLineIndex });
+
+  async function route(pc) {
+    try {
+      const st = await pc.getStats(); let pid = null;
+      st.forEach((r) => { if (r.type === 'transport' && r.selectedCandidatePairId) pid = r.selectedCandidatePairId; });
+      if (!pid) st.forEach((r) => { if (r.type === 'candidate-pair' && r.state === 'succeeded' && (r.selected || r.nominated)) pid = r.id; });
+      const p = pid && st.get(pid); if (!p) return '';
+      const l = st.get(p.localCandidateId), r = st.get(p.remoteCandidateId);
+      return ((l && l.candidateType === 'relay') || (r && r.candidateType === 'relay')) ? 'relayed' : 'direct';
+    } catch (_) { return ''; }
+  }
+
+  return { sha256, hmac, enc, hex, randId, validId, fingerprint, proof, safeEq, ICE, Signal, sdpOf, candOf, wire, route };
+})();
+
+const PLAYER_CORE = `// AirTap listener playback core. Runs inside an AudioWorklet (or a ScriptProcessor fallback).
+// Source frames go into a ring; output is read at srcRate/outRate * drift with a Kaiser-windowed sinc
+// interpolator (32 taps, 512 phases), so the browser's clock and AirTap's clock can differ without clicks,
+// and without the top-end loss a linear interpolator would cause.
+class AirTapPlayerCore {
+  constructor(srcRate, outRate, targetSec) {
+    this.cap = 1 << 19; this.mask = this.cap - 1;
+    this.L = new Float32Array(this.cap); this.R = new Float32Array(this.cap);
+    this.w = 0; this.r = 0;
+    this.srcRate = srcRate;
+    this.base = srcRate / outRate;
+    this.target = Math.round(targetSec * srcRate);
+    this.started = false; this.drift = 1; this.avg = 0; this.under = 0; this.peakL = 0; this.peakR = 0;
+    const Z = this.Z = 16, P = this.P = 512, T = 2 * Z;
+    const fc = Math.min(1, 1 / this.base) * 0.97;
+    const i0 = (x) => { let s = 1, t = 1; for (let k = 1; k < 40; k++) { t *= (x / (2 * k)) * (x / (2 * k)); s += t; } return s; };
+    const beta = 9.5, ib = i0(beta);
+    this.tab = new Float32Array((P + 1) * T);
+    for (let p = 0; p <= P; p++) {
+      const frac = p / P; let sum = 0;
+      for (let k = 0; k < T; k++) {
+        const x = (k - (Z - 1)) - frac, u = x / Z;
+        const win = Math.abs(u) >= 1 ? 0 : i0(beta * Math.sqrt(1 - u * u)) / ib;
+        const s = x === 0 ? 1 : Math.sin(Math.PI * fc * x) / (Math.PI * fc * x);
+        const v = s * win; this.tab[p * T + k] = v; sum += v;
+      }
+      for (let k = 0; k < T; k++) this.tab[p * T + k] /= sum;
+    }
+  }
+  push(f) {
+    const n = f.length >> 1, L = this.L, R = this.R, mask = this.mask;
+    for (let i = 0; i < n; i++) { const k = (this.w + i) & mask; L[k] = f[2 * i]; R[k] = f[2 * i + 1]; }
+    this.w += n;
+    if (this.w - this.r > this.cap - 16384) this.r = this.w - this.target;
+  }
+  render(oL, oR, N) {
+    const Z = this.Z, P = this.P, T = 2 * Z, tab = this.tab, L = this.L, R = this.R, mask = this.mask;
+    let fill = this.w - this.r;
+    if (fill > this.target * 3) { this.r = this.w - this.target; fill = this.target; this.avg = fill; }
+    if (!this.started) {
+      if (fill >= this.target) { this.started = true; this.avg = fill; }
+      else { oL.fill(0); oR.fill(0); return; }
+    }
+    // Clock drift: the buffer level jumps with every network packet, so steer on a ~3 s average of it and move
+    // the read rate gently (cap +-300 ppm, real crystals differ by far less). No audible wow from packet bursts.
+    this.avg += (fill - this.avg) * Math.min(1, N / (3 * this.srcRate));
+    const errSec = (this.avg - this.target) / this.srcRate;
+    const want = 1 + Math.max(-0.0003, Math.min(0.0003, errSec * 0.004));
+    this.drift += (want - this.drift) * Math.min(1, N / (2 * this.srcRate));
+    const step = this.base * this.drift;
+    let pl = this.peakL, pr = this.peakR;
+    for (let n = 0; n < N; n++) {
+      const i = Math.floor(this.r);
+      if (i + Z >= this.w) { oL[n] = 0; oR[n] = 0; this.under++; this.started = false; continue; }
+      const fp = (this.r - i) * P, p = fp | 0, a = fp - p, t0 = p * T, t1 = t0 + T, b = i - (Z - 1);
+      let sl = 0, sr = 0;
+      for (let k = 0; k < T; k++) {
+        const c = tab[t0 + k] + (tab[t1 + k] - tab[t0 + k]) * a, j = (b + k) & mask;
+        sl += L[j] * c; sr += R[j] * c;
+      }
+      oL[n] = sl; oR[n] = sr;
+      if (sl > pl) pl = sl; else if (-sl > pl) pl = -sl;
+      if (sr > pr) pr = sr; else if (-sr > pr) pr = -sr;
+      this.r += step;
+    }
+    this.peakL = pl; this.peakR = pr;
+  }
+  stats() {
+    const s = { fill: (this.w - this.r) / this.srcRate, ppm: (this.drift - 1) * 1e6, under: this.under, peakL: this.peakL, peakR: this.peakR, playing: this.started };
+    this.peakL = 0; this.peakR = 0; return s;
+  }
+}
+`;
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const streamId = decodeURIComponent((location.hash || '').slice(1)).trim();
+  window.addEventListener('hashchange', () => location.reload());
+  const TARGET = 0.4;               // seconds of audio held in the player buffer
+  let sig = null, pc = null, dc = null, ctx = null, node = null, gain = null, sp = null, core = null;
+  let hello = null, authed = false, bits = 24, pendingCands = [], denied = false, wantStop = false, connectTimer = null, statTimer = null, cid = '';
+
+  const setStatus = (t, cls) => { const s = $('status'); s.textContent = t; s.className = cls || ''; };
+  const setDetail = (t) => { $('detail').textContent = t; };
+  const kHz = (r) => (r / 1000).toFixed(r % 1000 ? 1 : 0) + ' kHz';
+  const fmtName = (b) => b === 32 ? '32-bit float, bit-exact' : b === 24 ? '24-bit lossless' : '16-bit';
+
+  if (!AT.validId(streamId)) {
+    setStatus('This link is incomplete', 'bad');
+    setDetail('Ask the sender for the full link. It ends with # and a code.');
+    $('go').disabled = true; $('form').hidden = true;
+    return;
+  }
+
+  async function ensureAudio() {
+    if (!ctx) {
+      try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (_) {}
+      const C = window.AudioContext || window.webkitAudioContext;
+      ctx = new C({ latencyHint: 'playback' });
+      gain = ctx.createGain(); gain.gain.value = +$('vol').value; gain.connect(ctx.destination);
+      if (ctx.audioWorklet) {
+        const src = PLAYER_CORE + `
+          class AirTapPlayer extends AudioWorkletProcessor {
+            constructor(o) { super(); const p = o.processorOptions; this.core = new AirTapPlayerCore(p.srcRate, sampleRate, p.target); this.n = 0;
+              this.port.onmessage = (e) => this.core.push(e.data); }
+            process(_, outs) { const o = outs[0]; this.core.render(o[0], o[1] || o[0], o[0].length);
+              if (++this.n % 48 === 0) this.port.postMessage(this.core.stats()); return true; }
+          }
+          registerProcessor('airtap-player', AirTapPlayer);`;
+        await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([src], { type: 'application/javascript' })));
+      }
+    }
+    if (ctx.state !== 'running') { try { await ctx.resume(); } catch (_) {} }
+  }
+
+  function startPlayer(rate) {
+    stopPlayer();
+    if (ctx.audioWorklet) {
+      node = new AudioWorkletNode(ctx, 'airtap-player', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2],
+                                                          processorOptions: { srcRate: rate, target: TARGET } });
+      node.port.onmessage = (e) => onPlayerStats(e.data);
+      node.connect(gain);
+    } else {   // not a secure context (e.g. opened over plain http): main-thread fallback
+      const Core = new Function(PLAYER_CORE + '; return AirTapPlayerCore;')();
+      core = new Core(rate, ctx.sampleRate, TARGET);
+      sp = ctx.createScriptProcessor(4096, 0, 2);
+      sp.onaudioprocess = (e) => { const b = e.outputBuffer; core.render(b.getChannelData(0), b.getChannelData(1), b.length); };
+      sp.connect(gain);
+      statTimer = setInterval(() => onPlayerStats(core.stats()), 150);
+    }
+    window.__airtap = { ctx, gain, node, rate };
+  }
+  function stopPlayer() {
+    clearInterval(statTimer); statTimer = null;
+    if (node) { try { node.disconnect(); } catch (_) {} node = null; }
+    if (sp) { try { sp.disconnect(); } catch (_) {} sp = null; core = null; }
+  }
+  function pushAudio(f) { if (node) node.port.postMessage(f, [f.buffer]); else if (core) core.push(f); }
+
+  let lastInfo = 0;
+  function onPlayerStats(s) {
+    const db = (v) => v > 0 ? Math.max(0, Math.min(100, (20 * Math.log10(v) + 60) / 60 * 100)) : 0;
+    $('mL').style.width = db(s.peakL) + '%'; $('mR').style.width = db(s.peakR) + '%';
+    const now = performance.now();
+    if (now - lastInfo > 1000 && hello) {
+      lastInfo = now;
+      AT.route(pc).then((r) => {
+        setDetail(kHz(hello.rate) + ' · ' + fmtName(bits) + (r ? ' · ' + (r === 'direct' ? 'direct connection' : 'through relay') : '') +
+                  ' · buffer ' + s.fill.toFixed(2) + ' s' + (s.under ? ' · dropouts ' + s.under : ''));
+      });
+      if (authed) setStatus(s.playing ? 'Playing' : 'Buffering…', s.playing ? 'ok' : '');
+    }
+  }
+
+  function decode(buf, b) {
+    if (b === 32) return new Float32Array(buf);
+    if (b === 24) {
+      const u = new Uint8Array(buf), n = (u.length / 3) | 0, f = new Float32Array(n);
+      for (let i = 0, j = 0; i < n; i++, j += 3) { let v = u[j] | (u[j + 1] << 8) | (u[j + 2] << 16); if (v & 0x800000) v -= 0x1000000; f[i] = v / 8388608; }
+      return f;
+    }
+    const s = new Int16Array(buf), f = new Float32Array(s.length);
+    for (let i = 0; i < s.length; i++) f[i] = s[i] / 32768;
+    return f;
+  }
+
+  function teardown() {
+    clearTimeout(connectTimer);
+    if (dc) { dc.onclose = null; try { dc.close(); } catch (_) {} dc = null; }
+    if (pc) { try { pc.close(); } catch (_) {} pc = null; }
+    if (sig) { sig.close(); sig = null; }
+    stopPlayer(); hello = null; authed = false; pendingCands = [];
+  }
+
+  function sendAuth() {
+    const pw = $('pw').value;
+    const p = hello.protected ? AT.proof(pw, hello.nonce, pc.remoteDescription.sdp, pc.localDescription.sdp) : '';
+    bits = +$('q').value;
+    dc.send(JSON.stringify({ t: 'auth', proof: p, bits }));
+    setStatus('Checking password…');
+  }
+
+  async function connect() {
+    teardown(); denied = false; wantStop = false;
+    setStatus('Connecting…'); setDetail('Finding the sender…');
+    $('stop').disabled = false;
+    const myId = 'airtap-l-' + AT.randId(14);
+    sig = new AT.Signal(myId, onSignal, (st, msg) => {
+      if (st === 'open') makeOffer();
+      else if (st === 'error') { setStatus('Handshake server problem', 'bad'); setDetail(String(msg || '')); }
+    });
+    sig.open();
+    connectTimer = setTimeout(() => {
+      if (!hello) { setStatus("Can't reach the stream", 'bad'); setDetail('The sender may not be streaming right now. Try again in a moment.'); teardown(); $('stop').disabled = true; }
+    }, 25000);
+  }
+
+  async function makeOffer() {
+    pc = new RTCPeerConnection({ iceServers: AT.ICE });
+    dc = pc.createDataChannel('airtap', { ordered: true });
+    dc.binaryType = 'arraybuffer';
+    dc.onmessage = onData;
+    dc.onclose = () => {
+      if (wantStop) return;
+      if (denied) { setStatus('Wrong password', 'bad'); setDetail('Check the password (it is case-sensitive) and press Listen again.'); }
+      else { setStatus('Stream ended'); setDetail('The sender stopped, or the connection dropped. Press Listen to reconnect.'); }
+      teardown(); $('stop').disabled = true; $('form').hidden = false; $('player').hidden = true;
+    };
+    pc.onicecandidate = (e) => { if (e.candidate && sig) sig.send('CANDIDATE', streamId, AT.wire(cid, { candidate: AT.candOf(e.candidate) })); };
+    pc.onconnectionstatechange = () => {
+      if (pc && pc.connectionState === 'failed') { setStatus('Could not connect', 'bad'); setDetail('Neither a direct connection nor the relay got through from this network.'); }
+    };
+    cid = 'dc_' + AT.randId(12);
+    await pc.setLocalDescription(await pc.createOffer());
+    sig.send('OFFER', streamId, AT.wire(cid, { sdp: AT.sdpOf(pc.localDescription), kind: 'airtap' }));
+    setDetail('Connecting to the sender…');
+  }
+
+  async function onSignal(m) {
+    const p = m.payload || {};
+    if (m.src !== streamId) return;
+    if (m.type === 'ANSWER' && pc) {
+      await pc.setRemoteDescription(p.sdp);
+      for (const c of pendingCands) pc.addIceCandidate(c).catch(() => {});
+      pendingCands = [];
+    } else if (m.type === 'CANDIDATE' && pc) {
+      if (pc.remoteDescription) pc.addIceCandidate(p.candidate).catch(() => {}); else pendingCands.push(p.candidate);
+    } else if (m.type === 'EXPIRE') {
+      setStatus("The sender isn't streaming", 'bad'); setDetail('Ask them to press Start Streaming in AirTap, then press Listen again.');
+      teardown(); $('stop').disabled = true;
+    }
+  }
+
+  function onData(e) {
+    if (typeof e.data !== 'string') { if (authed) pushAudio(decode(e.data, bits)); return; }
+    let m; try { m = JSON.parse(e.data); } catch (_) { return; }
+    if (m.t === 'hello') {
+      hello = m; clearTimeout(connectTimer);
+      if (m.protected && !$('pw').value) { setStatus('Password needed'); setDetail('This stream is password protected. Enter it and press Listen.'); $('pw').focus(); return; }
+      sendAuth();
+    } else if (m.t === 'ok') {
+      authed = true; bits = m.bits; startPlayer(m.rate);
+      setStatus('Buffering…'); setDetail(kHz(m.rate) + ' · ' + fmtName(bits));
+      $('form').hidden = true; $('player').hidden = false;
+      try { navigator.wakeLock && navigator.wakeLock.request('screen').catch(() => {}); } catch (_) {}
+    } else if (m.t === 'busy') {
+      wantStop = true; setStatus('Stream is full', 'bad'); setDetail(m.msg || 'Too many listeners right now. Try again later.');
+      teardown(); $('stop').disabled = true;
+    } else if (m.t === 'denied') {
+      denied = true; setStatus('Wrong password', 'bad');
+    }
+  }
+
+  $('go').onclick = async () => {
+    $('go').disabled = true;
+    try {
+      await ensureAudio();
+      if (dc && dc.readyState === 'open' && hello && !authed) sendAuth();   // second try on the same connection
+      else await connect();
+    } finally { $('go').disabled = false; }
+  };
+  $('stop').onclick = () => {
+    wantStop = true; teardown();
+    setStatus('Stopped'); setDetail('Press Listen to start again.');
+    $('stop').disabled = true; $('form').hidden = false; $('player').hidden = true;
+  };
+  $('vol').oninput = (e) => { if (gain) gain.gain.value = (+e.target.value) ** 2; };
+  $('pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('go').click(); });
+})();
+</script>
+</body>
+</html>
