@@ -311,6 +311,7 @@ class AirTapPlayerCore {
   const TARGET = 1.0, MAX_TARGET = 4.0;   // seconds of audio held in the player buffer: starts at 1 s, grows after a dropout
   let sig = null, pc = null, dc = null, ctx = null, node = null, gain = null, sp = null, core = null;
   let hello = null, authed = false, bits = 24, pendingCands = [], denied = false, wantStop = false, connectTimer = null, statTimer = null, cid = '';
+  let lastInfo = 0, lastStats = null, telBytes = 0, telT = 0;
 
   const setStatus = (t, cls) => { const s = $('status'); s.textContent = t; s.className = cls || ''; };
   const setDetail = (t) => { $('detail').textContent = t; };
@@ -333,9 +334,11 @@ class AirTapPlayerCore {
       if (ctx.audioWorklet) {
         const src = PLAYER_CORE + `
           class AirTapPlayer extends AudioWorkletProcessor {
-            constructor(o) { super(); const p = o.processorOptions; this.core = new AirTapPlayerCore(p.srcRate, sampleRate, p.target, p.max); this.n = 0;
-              this.port.onmessage = (e) => this.core.push(e.data); }
-            process(_, outs) { const o = outs[0]; this.core.render(o[0], o[1] || o[0], o[0].length);
+            constructor(o) { super(); const p = o.processorOptions; this.core = new AirTapPlayerCore(p.srcRate, sampleRate, p.target, p.max); this.n = 0; this.alive = true;
+              this.port.onmessage = (e) => { if (e.data && e.data.stop) { this.alive = false; this.port.close(); } else if (this.alive) this.core.push(e.data); }; }
+            process(_, outs) {
+              if (!this.alive) return false;          // a stopped player ends for good: no more audio, no more reports
+              const o = outs[0]; this.core.render(o[0], o[1] || o[0], o[0].length);
               if (++this.n % 48 === 0) this.port.postMessage(this.core.stats()); return true; }
           }
           registerProcessor('airtap-player', AirTapPlayer);`;
@@ -364,12 +367,17 @@ class AirTapPlayerCore {
   }
   function stopPlayer() {
     clearInterval(statTimer); statTimer = null;
-    if (node) { try { node.disconnect(); } catch (_) {} node = null; }
-    if (sp) { try { sp.disconnect(); } catch (_) {} sp = null; core = null; }
+    if (node) {   // cut its reports first, then stop it: an old player must never talk over the new one
+      const old = node; node = null;
+      old.port.onmessage = null;
+      try { old.port.postMessage({ stop: true }); } catch (_) {}
+      try { old.disconnect(); } catch (_) {}
+    }
+    if (sp) { sp.onaudioprocess = null; try { sp.disconnect(); } catch (_) {} sp = null; core = null; }
+    lastStats = null; telBytes = 0; telT = 0;
   }
   function pushAudio(f) { if (node) node.port.postMessage(f, [f.buffer]); else if (core) core.push(f); }
 
-  let lastInfo = 0, lastStats = null;
   function onPlayerStats(s) {
     lastStats = s;
     const db = (v) => v > 0 ? Math.max(0, Math.min(100, (20 * Math.log10(v) + 60) / 60 * 100)) : 0;
@@ -386,7 +394,6 @@ class AirTapPlayerCore {
   }
 
   // every 2 s: tell the sender how this end is doing (shows up in AirTap's log)
-  let telBytes = 0, telT = 0;
   setInterval(async () => {
     if (!authed || !dc || dc.readyState !== 'open' || !lastStats || !pc) return;
     let rtt = null, bytes = 0, route = '';
